@@ -1,106 +1,105 @@
 require('dotenv').config();
 const { Client } = require('discord.js-selfbot-v13');
-const schedule = require('node-schedule');
-const fs = require('fs');
+const axios = require('axios');
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 
-let interval = '*/10 * * * * *'; 
-let messageCount = 0; 
-
 const client = new Client({ checkUpdate: false });
-const sentMessages = new Set();
-let messages = [];
+let focusedUserId = null;
+let isWaitingForReply = false;
 
-const colors = [
-  '\x1b[31m', 
-  '\x1b[32m', 
-  '\x1b[33m', 
-  '\x1b[34m', 
-  '\x1b[35m', 
-  '\x1b[36m', 
-];
-const reset = '\x1b[0m';
-
-function loadMessages() {
+async function checkSlowmode(channel) {
   try {
-    const data = fs.readFileSync('kata.txt', 'utf8');
-    messages = data.split('\n').filter(line => line.trim() !== '');
+    const slowmode = channel.rateLimitPerUser;
+    console.log(slowmode > 0 ? `Slowmode active: ${slowmode} seconds` : 'No slowmode active');
+    return slowmode;
   } catch (error) {
-    console.error('Error reading kata.txt:', error);
+    console.error('Error checking slowmode:', error);
+    return 0;
   }
 }
 
-client.on('ready', () => {
-  console.log(`Logged in as ${client.user.tag}!`);
-  loadMessages(); 
-  scheduleMessage();
-});
+async function getLastMessage(channel) {
+  try {
+    const messages = await channel.messages.fetch({ limit: 1 });
+    return messages.size === 0 ? null : messages.first();
+  } catch (error) {
+    console.error('Error fetching last message:', error);
+    return null;
+  }
+}
+
+async function respondToMessage(message) {
+  if (!message.content.trim().endsWith('?')) {
+    console.log(`Skipping non-question message from ${message.author.username}: ${message.content}`);
+    return;
+  }
+  try {
+    const response = await axios.get('https://api.ryzendesu.vip/api/ai/v2/chatgpt', {
+      params: { text: message.content },
+    });
+    if (response.data && response.data.action === 'success') {
+      const reply = response.data.response;
+      const friendlyReply = `${reply} 😊`;
+      await message.reply(friendlyReply);
+      console.log(`Bot replied to ${message.author.username}: ${friendlyReply}`);
+    } else {
+      console.error('Invalid API response.');
+    }
+  } catch (error) {
+    console.error('Error fetching AI response:', error);
+  }
+}
+
+async function processMessages() {
+  try {
+    const channel = await client.channels.fetch(CHANNEL_ID);
+    if (!channel) return;
+
+    const slowmode = await checkSlowmode(channel);
+
+    if (!isWaitingForReply) {
+      const lastMessage = await getLastMessage(channel);
+      if (lastMessage && lastMessage.author.id !== client.user.id) {
+        focusedUserId = lastMessage.author.id;
+        console.log(`Focusing on user: ${lastMessage.author.username}`);
+        await respondToMessage(lastMessage);
+        isWaitingForReply = true;
+
+        setTimeout(async () => {
+          if (isWaitingForReply) {
+            console.log(`No response from ${lastMessage.author.username}. Looking for new message...`);
+            isWaitingForReply = false;
+            focusedUserId = null;
+            await processMessages();
+          }
+        }, Math.max(Math.random() * (180000 - 120000) + 120000, slowmode * 1000));
+      }
+    }
+  } catch (error) {
+    console.error('Error processing messages:', error);
+  }
+}
 
 client.on('messageCreate', async (message) => {
-  if (message.content.startsWith('!setinterval ')) {
-    const newInterval = message.content.split('!setinterval ')[1];
-    if (newInterval) {
-      interval = newInterval;
-      message.channel.send(`Interval changed to: ${interval}`);
-      schedule.cancelJob('messageJob');
-      scheduleMessage();
-    } else {
-      message.channel.send('Please provide a new interval.');
-    }
+  if (message.author.bot || message.author.id === client.user.id) return;
+
+  if (message.author.id === focusedUserId) {
+    isWaitingForReply = false;
+    console.log(`Reply detected from ${message.author.username}. Responding...`);
+    await respondToMessage(message);
+    setTimeout(() => {
+      isWaitingForReply = true;
+    }, Math.random() * (180000 - 120000) + 120000);
   }
 });
 
-function getUniqueMessage() {
-  if (messages.length === 0) {
-    return 'No messages available.';
-  }
-
-  let message;
-  do {
-    const randomIndex = Math.floor(Math.random() * messages.length);
-    message = messages[randomIndex];
-  } while (sentMessages.has(message) && sentMessages.size < messages.length);
-
-  sentMessages.add(message);
-  return message;
-}
-
-async function deletePreviousMessages(channel) {
-  try {
-    const fetchedMessages = await channel.messages.fetch({ limit: 100 });
-    const botMessages = fetchedMessages.filter(msg => msg.author.id === client.user.id);
-    for (const msg of botMessages.values()) {
-      await msg.delete();
-    }
-  } catch (error) {
-    console.error('Error deleting previous messages:', error);
-  }
-}
-
-function scheduleMessage() {
-  schedule.scheduleJob('messageJob', interval, async function() {
-    try {
-      const channel = await client.channels.fetch(CHANNEL_ID);
-      if (channel) {
-        await deletePreviousMessages(channel);
-        const messageText = getUniqueMessage();
-        const color = colors[messageCount % colors.length];
-        const coloredMessageText = `${color}${messageText}${reset}`;
-        messageCount++;
-        console.log(`(${messageCount}) Sedang Mengirim Pesan: ${coloredMessageText} ✅`);
-        const message = await channel.send(messageText);
-        console.log('Pesan Bot Sukses Terkirim 📨');
-        setTimeout(async () => {
-          await message.delete();
-          console.log('Pesan Bot Telah Di Hapus 🗑️');
-        }, 5000);
-      }
-    } catch (error) {
-      console.error('Error sending message:', error);
-    }
-  });
-}
+client.on('ready', async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  const channel = await client.channels.fetch(CHANNEL_ID);
+  if (channel) await checkSlowmode(channel);
+  processMessages();
+});
 
 client.login(DISCORD_TOKEN);
